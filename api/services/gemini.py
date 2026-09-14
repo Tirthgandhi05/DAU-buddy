@@ -531,14 +531,20 @@ def call_gemini_api(
     api_key: str,
     system_instruction: str,
     history: Optional[List[ChatMessage]] = None,
+    trace=None,
 ) -> Tuple[str, Dict[str, int]]:
     """
     Call the Google Gemini API using the google-genai SDK, with tool support.
     Returns a tuple of (response_text, usage_metadata_dict).
+    trace : optional
+     When provided, this function records a *generation* span (with token counts) and
+        a child *span* for every tool call, so the full LLM interaction
+        is visible in the Langfuse dashboard.  ``None`` disables tracing.
     """
     import os
     from google import genai
     from google.genai import types
+    from api.observability.langfuse_client import get_langfuse
 
     gemini_key = os.getenv("GEMINI_API_KEY")
     if not gemini_key:
@@ -594,6 +600,23 @@ def call_gemini_api(
 
     model_id = get_gemini_model()
 
+    lf = get_langfuse()
+    lf_generation = None
+    if lf and trace:
+        try:
+            lf_generation = trace.generation(
+                name="gemini",
+                model=model_id,
+                input={
+                    "system_instruction": system_instruction[:500],
+                    "user_message": latest_msg[:500],
+                    "history_turns": len(history or []),
+                },
+                metadata={"temperature": 0.3, "max_output_tokens": 4000},
+            )
+        except Exception:
+            logger.debug("Langfuse generation start failed — continuing without tracing.")
+
     try:
         response = client.models.generate_content(
             model=model_id,
@@ -619,7 +642,25 @@ def call_gemini_api(
             for fc in calls:
                 args = dict(fc.args) if fc.args else {}
                 logger.info(f"Gemini requested tool call: {fc.name}({args})")
+
+                # ── Langfuse: span per tool call ──────────────────────────
+                tool_span = None
+                if lf_generation:
+                    try:
+                        tool_span = lf_generation.span(
+                            name=f"tool:{fc.name}",
+                            input={"name": fc.name, "args": args},
+                        )
+                    except Exception:
+                        pass
+
                 tool_result = tool_bridge.dispatch(fc.name, args)
+
+                if tool_span:
+                    try:
+                        tool_span.end(output={"result": str(tool_result)[:2000]})
+                    except Exception:
+                        pass
 
                 try:
                     # Some tools might return dicts directly or JSON strings
@@ -663,10 +704,21 @@ def call_gemini_api(
                     f"Gemini still requesting tools after {MAX_TOOL_TURNS} turns — "
                     "returning a best-effort reply."
                 )
-                return (
+                exhaustion_msg = (
                     "I wasn't able to pull all of that together. Could you ask about "
                     "one thing at a time — a specific person, course, or book?"
-                ), {}
+                )
+                # ── Langfuse: end generation on tool-loop exhaustion ──────
+                if lf_generation:
+                    try:
+                        lf_generation.end(
+                            output=exhaustion_msg,
+                            status_message="tool_loop_exhausted",
+                            metadata={"tool_turns": MAX_TOOL_TURNS},
+                        )
+                    except Exception:
+                        pass
+                return exhaustion_msg, {}
 
         usage = response.usage_metadata
         usage_dict = {
@@ -691,8 +743,33 @@ def call_gemini_api(
         if not out_text:
             out_text = "I checked the system, but there is no additional information to provide right now."
 
+        # ── Langfuse: end generation with token counts ────────────────
+        if lf_generation:
+            try:
+                lf_generation.end(
+                    output=out_text,
+                    usage={
+                        "input": usage_dict.get("prompt_token_count", 0),
+                        "output": usage_dict.get("candidates_token_count", 0),
+                        "total": usage_dict.get("total_token_count", 0),
+                        "unit": "TOKENS",
+                    },
+                )
+            except Exception:
+                pass
+
         return out_text, usage_dict
     except Exception as e:
         logger.error(f"Native Gemini API Error: {e}")
+        # ── Langfuse: mark generation as error ────────────────────────
+        if lf_generation:
+            try:
+                lf_generation.end(
+                    output=str(e),
+                    status_message="error",
+                    metadata={"error": str(e)},
+                )
+            except Exception:
+                pass
         raise e
 

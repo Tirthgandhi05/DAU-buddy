@@ -1,0 +1,66 @@
+version: "3.9"
+
+services:
+  # 1. DAU Buddy Primary Database
+  dau-db:
+    image: postgres:15
+    container_name: dau-postgres
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: daiict_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: your_database_password_here
+    volumes:
+      - dau_pgdata:/var/lib/postgresql/data
+
+  # 2. Langfuse Database (for traces)
+  langfuse-db:
+    image: postgres:15
+    container_name: langfuse-postgres
+    restart: unless-stopped
+    ports:
+      - "5433:5432" # Mapped to 5433 so it doesn't conflict with dau-db
+    environment:
+      POSTGRES_DB: langfuse
+      POSTGRES_USER: langfuse
+      POSTGRES_PASSWORD: langfuse_db_password
+    volumes:
+      - langfuse_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U langfuse"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # 3. Langfuse Server (Dashboard & API)
+  langfuse-server:
+    image: langfuse/langfuse:2
+    container_name: langfuse-server
+    restart: unless-stopped
+    depends_on:
+      langfuse-db:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+    environment:
+      DATABASE_URL: postgresql://langfuse:langfuse_db_password@langfuse-db:5432/langfuse
+      NEXTAUTH_SECRET: my_super_secret_nextauth_key_123
+      SALT: my_super_secret_salt_123
+      NEXTAUTH_URL: http://localhost:3000
+      # Auto-setup initial admin and project keys
+      LANGFUSE_INIT_ORG_ID: dau-buddy-org
+      LANGFUSE_INIT_ORG_NAME: "DAU Buddy"
+      LANGFUSE_INIT_PROJECT_ID: dau-buddy-prod
+      LANGFUSE_INIT_PROJECT_NAME: "DAU Buddy Production"
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: pk-lf-your-public-key
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: sk-lf-your-secret-key
+      LANGFUSE_INIT_USER_EMAIL: admin@dau.ac.in
+      LANGFUSE_INIT_USER_NAME: "DAU Admin"
+      LANGFUSE_INIT_USER_PASSWORD: adminpassword
+      TELEMETRY_ENABLED: "false"
+
+volumes:
+  dau_pgdata:
+  langfuse_pgdata:

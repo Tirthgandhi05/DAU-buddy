@@ -71,11 +71,17 @@ def create_app() -> FastAPI:
     def startup_event():
         from core.database import init_pool
         init_pool()
+        from api.observability.langfuse_client import get_langfuse
+        get_langfuse()
 
     @app.on_event("shutdown")
     def shutdown_event():
         from core.database import _shutdown_pool
         _shutdown_pool()
+        # Flush pending Langfuse events so traces in the SDK's in-memory
+        # buffer are not lost when the server stops.
+        from api.observability.langfuse_client import flush
+        flush()
 
     app.state.limiter = limiter
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)

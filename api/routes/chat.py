@@ -28,6 +28,7 @@ from api.services.caller_identity import CallerIdentity, resolve_caller
 from api.services.context_builder import build_caller_context
 from api.services.library_service import LibraryService
 from api.services import calendar_service
+from api.observability.langfuse_client import get_langfuse, hash_user_id
 
 from scrapers import faculty_scraper, staff_scraper
 
@@ -335,6 +336,33 @@ async def chat_endpoint(request: Request, body: ChatRequest, auth: tuple[str, st
         except Exception as e:
             logger.error(f"Failed to log web chat analytics: {e}")
 
+        # ── Langfuse: create root trace for this chat request ─────────────
+        # session_id is derived from the oldest message so it stays stable
+        # across turns of the same conversation.
+        lf = get_langfuse()
+        trace = None
+        if lf:
+            try:
+                first_msg = (history[0].text if history else body.message)[:64]
+                session_id = "s_" + hashlib.sha256(
+                    (email + first_msg).encode()
+                ).hexdigest()[:12]
+                trace = lf.trace(
+                    name="chat",
+                    user_id=hash_user_id(email),
+                    session_id=session_id,
+                    input=body.message,
+                    metadata={
+                        "role": role,
+                        "email_domain": email.split("@")[-1],
+                        "history_turns": len(history),
+                        "client": "web-chat",
+                    },
+                    tags=["web-chat"],
+                )
+            except Exception as e:
+                logger.debug(f"Langfuse trace creation failed: {e}")
+
         # ── 0. Library Search Trigger (Fallback) ──────────────────────────────
         gemini_available = bool(os.getenv("GEMINI_API_KEY") and is_gemini_available())
         openai_available = bool(os.getenv("OPENAI_API_KEY") and is_openai_available())
@@ -466,12 +494,22 @@ async def chat_endpoint(request: Request, body: ChatRequest, auth: tuple[str, st
             if gemini_api_key and is_gemini_available():
                 try:
                     response_text, token_usage = await _run_blocking(
-                        call_gemini_api, gemini_api_key, system_instruction, history
+                        call_gemini_api, gemini_api_key, system_instruction, history, trace
                     )
+                    if trace:
+                        try:
+                            trace.update(output=response_text, tags=["web-chat", "gemini"])
+                        except Exception:
+                            pass
                     return ChatResponse(response=response_text)
                 except asyncio.TimeoutError:
                     logger.error(f"Gemini RAG exceeded {LLM_TIMEOUT_S}s — abandoning.")
                     record_gemini_failure()
+                    if trace:
+                        try:
+                            trace.update(metadata={"timed_out": True, "engine": "gemini"}, tags=["web-chat", "gemini", "timeout"])
+                        except Exception:
+                            pass
                 except Exception:
                     logger.exception("Gemini RAG failed.")
                     record_gemini_failure()
@@ -481,12 +519,22 @@ async def chat_endpoint(request: Request, body: ChatRequest, auth: tuple[str, st
                 try:
                     logger.info("Falling back to OpenAI RAG...")
                     response_text, token_usage = await _run_blocking(
-                        call_openai_api, openai_api_key, system_instruction, history
+                        call_openai_api, openai_api_key, system_instruction, history, trace
                     )
+                    if trace:
+                        try:
+                            trace.update(output=response_text, tags=["web-chat", "openai"])
+                        except Exception:
+                            pass
                     return ChatResponse(response=response_text)
                 except asyncio.TimeoutError:
                     logger.error(f"OpenAI RAG exceeded {LLM_TIMEOUT_S}s — abandoning.")
                     record_openai_failure()
+                    if trace:
+                        try:
+                            trace.update(metadata={"timed_out": True, "engine": "openai"}, tags=["web-chat", "openai", "timeout"])
+                        except Exception:
+                            pass
                 except Exception:
                     logger.exception("OpenAI RAG failed.")
                     record_openai_failure()
@@ -494,14 +542,51 @@ async def chat_endpoint(request: Request, body: ChatRequest, auth: tuple[str, st
             # If both fail or are skipped, fall through to NLP fallback
             logger.warning("RAG engines unavailable or failed — falling back to local NLP engine/library.")
             if _is_library_query(body.message):
-                return ChatResponse(response=await handle_library_fallback(_extract_book_query(body.message)))
-            return ChatResponse(response=await _run_blocking(process_fallback_message, body.message))
+                fb_result = await handle_library_fallback(_extract_book_query(body.message))
+                if trace:
+                    try:
+                        trace.update(output=fb_result, tags=["web-chat", "fallback", "library"])
+                    except Exception:
+                        pass
+                return ChatResponse(response=fb_result)
+
+            # ── Langfuse: span for local NLP fallback ─────────────────────
+            fb_span = None
+            if trace:
+                try:
+                    fb_span = trace.span(name="local-nlp-fallback", input=body.message)
+                except Exception:
+                    pass
+            fb_result = await _run_blocking(process_fallback_message, body.message)
+            if fb_span:
+                try:
+                    fb_span.end(output=fb_result[:500])
+                except Exception:
+                    pass
+            if trace:
+                try:
+                    trace.update(output=fb_result, tags=["web-chat", "fallback"])
+                except Exception:
+                    pass
+            return ChatResponse(response=fb_result)
 
         # ── 3. Local NLP Fallback ──────────────────────────────────────────────
         logger.info("No AI APIs available or in cooldown — using local NLP engine.")
         if _is_library_query(body.message):
-            return ChatResponse(response=await handle_library_fallback(_extract_book_query(body.message)))
-        return ChatResponse(response=await _run_blocking(process_fallback_message, body.message))
+            fb_result = await handle_library_fallback(_extract_book_query(body.message))
+            if trace:
+                try:
+                    trace.update(output=fb_result, tags=["web-chat", "fallback", "library"])
+                except Exception:
+                    pass
+            return ChatResponse(response=fb_result)
+        fb_result = await _run_blocking(process_fallback_message, body.message)
+        if trace:
+            try:
+                trace.update(output=fb_result, tags=["web-chat", "fallback"])
+            except Exception:
+                pass
+        return ChatResponse(response=fb_result)
 
     except HTTPException:
         # Re-raise HTTPExceptions so FastAPI can return the correct status code (e.g. 401)
@@ -511,10 +596,16 @@ async def chat_endpoint(request: Request, body: ChatRequest, auth: tuple[str, st
         # letting the connection hang until the proxy resets it — a reset is
         # what surfaces in the browser as "Failed to fetch".
         logger.error("Chat request timed out waiting on a blocking stage.")
-        return ChatResponse(response=(
+        timeout_msg = (
             "⏳ That took longer than expected and I had to stop. "
             "Please try again, or ask a narrower question."
-        ))
+        )
+        if trace:
+            try:
+                trace.update(output=timeout_msg, metadata={"timed_out": True}, tags=["web-chat", "timeout"])
+            except Exception:
+                pass
+        return ChatResponse(response=timeout_msg)
     except Exception as e:
         # Must return a ChatResponse: falling off the end returns None, which
         # fails response_model validation and turns every error into an opaque 500.
@@ -522,7 +613,13 @@ async def chat_endpoint(request: Request, body: ChatRequest, auth: tuple[str, st
         # `raise HTTPException(500, detail=str(e))`, which put the raw exception
         # text in the response body and gave the chat UI nothing useful to show.
         logger.exception(f"Unhandled error in chat endpoint: {e}")
-        return ChatResponse(response=(
+        error_msg = (
             "⚠️ Something went wrong on my side while answering that. "
             "Please try again in a moment."
-        ))
+        )
+        if trace:
+            try:
+                trace.update(output=error_msg, metadata={"error": str(e)}, tags=["web-chat", "error"])
+            except Exception:
+                pass
+        return ChatResponse(response=error_msg)

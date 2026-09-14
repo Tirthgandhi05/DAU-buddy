@@ -46,10 +46,18 @@ MAX_TOOL_TURNS = 8
 # ==============================================================================
 # OpenAI Chat Execution
 # ==============================================================================
-def call_openai_api(api_key: str, system_instruction: str, history: List[ChatMessage]) -> Tuple[str, dict]:
+def call_openai_api(api_key: str, system_instruction: str, history: List[ChatMessage], trace=None) -> Tuple[str, dict]:
     """
     Calls the OpenAI API with function-calling support.
+
+    Parameters
+    ----------
+    trace : optional
+        A Langfuse trace object.  When provided, records a generation span
+        (with token counts) and a child span for every tool call.
     """
+    from api.observability.langfuse_client import get_langfuse
+
     url = "https://api.openai.com/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -67,7 +75,10 @@ def call_openai_api(api_key: str, system_instruction: str, history: List[ChatMes
 
     if len(messages) == 1:
         messages.append({"role": "user", "content": "Hello"})
-        
+
+    # Determine the latest user message for Langfuse input
+    latest_user_msg = messages[-1].get("content", "") if messages else ""
+
     payload = {
         "model": "gpt-4o-mini",
         "messages": messages,
@@ -76,6 +87,24 @@ def call_openai_api(api_key: str, system_instruction: str, history: List[ChatMes
         "temperature": 0.3,
         "max_tokens": 4000
     }
+
+    # ── Langfuse: start a generation span for this OpenAI session ─────────
+    lf = get_langfuse()
+    lf_generation = None
+    if lf and trace:
+        try:
+            lf_generation = trace.generation(
+                name="openai",
+                model="gpt-4o-mini",
+                input={
+                    "system_instruction": system_instruction[:500],
+                    "user_message": latest_user_msg[:500],
+                    "history_turns": len(history or []),
+                },
+                metadata={"temperature": 0.3, "max_tokens": 4000},
+            )
+        except Exception:
+            logger.debug("Langfuse generation start failed — continuing without tracing.")
 
     usage_dict = {"prompt_token_count": 0, "candidates_token_count": 0, "total_token_count": 0}
 
@@ -97,10 +126,20 @@ def call_openai_api(api_key: str, system_instruction: str, history: List[ChatMes
             turns += 1
             if turns > MAX_TOOL_TURNS:
                 logger.warning(f"OpenAI still requesting tools after {MAX_TOOL_TURNS} turns — stopping.")
-                return (
+                exhaustion_msg = (
                     "I wasn't able to pull all of that together. Could you ask about "
                     "one thing at a time — a specific person, course, or book?"
-                ), usage_dict
+                )
+                if lf_generation:
+                    try:
+                        lf_generation.end(
+                            output=exhaustion_msg,
+                            status_message="tool_loop_exhausted",
+                            metadata={"tool_turns": MAX_TOOL_TURNS},
+                        )
+                    except Exception:
+                        pass
+                return exhaustion_msg, usage_dict
             messages.append(message)
             
             for tool_call in message["tool_calls"]:
@@ -112,8 +151,25 @@ def call_openai_api(api_key: str, system_instruction: str, history: List[ChatMes
                     args = {}
 
                 logger.info(f"OpenAI requested tool call: {function_name}({args})")
-                
+
+                # ── Langfuse: span per tool call ──────────────────────────
+                tool_span = None
+                if lf_generation:
+                    try:
+                        tool_span = lf_generation.span(
+                            name=f"tool:{function_name}",
+                            input={"name": function_name, "args": args},
+                        )
+                    except Exception:
+                        pass
+
                 tool_result = tool_bridge.dispatch(function_name, args)
+
+                if tool_span:
+                    try:
+                        tool_span.end(output={"result": str(tool_result)[:2000]})
+                    except Exception:
+                        pass
 
                 messages.append({
                     "role": "tool",
@@ -135,13 +191,39 @@ def call_openai_api(api_key: str, system_instruction: str, history: List[ChatMes
 
         usage_dict["total_token_count"] = usage_dict["prompt_token_count"] + usage_dict["candidates_token_count"]
         out_text = message.get("content") or "I checked the system, but there is no additional information to provide right now."
+
+        # ── Langfuse: end generation with token counts ────────────────
+        if lf_generation:
+            try:
+                lf_generation.end(
+                    output=out_text,
+                    usage={
+                        "input": usage_dict.get("prompt_token_count", 0),
+                        "output": usage_dict.get("candidates_token_count", 0),
+                        "total": usage_dict.get("total_token_count", 0),
+                        "unit": "TOKENS",
+                    },
+                )
+            except Exception:
+                pass
+
         return out_text, usage_dict
         
     except requests.exceptions.RequestException as e:
         logger.error(f"OpenAI API Request Error: {e}")
         if response := getattr(e, 'response', None):
             logger.error(f"Response Body: {response.text}")
+        if lf_generation:
+            try:
+                lf_generation.end(output=str(e), status_message="error", metadata={"error": str(e)})
+            except Exception:
+                pass
         raise e
     except Exception as e:
         logger.error(f"OpenAI Integration Error: {e}")
+        if lf_generation:
+            try:
+                lf_generation.end(output=str(e), status_message="error", metadata={"error": str(e)})
+            except Exception:
+                pass
         raise e
